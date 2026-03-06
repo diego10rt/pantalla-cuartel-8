@@ -8,101 +8,77 @@ from flask import Flask, render_template, jsonify, request, Response, stream_wit
 app = Flask(__name__)
 
 # ══════════════════════════════════════════
-#  CONFIGURACIÓN 8VA COMPAÑÍA
+#  CONFIGURACIÓN 8VA COMPAÑÍA (OFICIAL)
 # ══════════════════════════════════════════
 ID_PROCE         = '00000000edc0241d'
-UNIDAD_EMERGENCI = '10'                          
-EMERGENCI_URL    = f'https://emergenci.app/screen/{UNIDAD_EMERGENCI}'
 CUARTEL_LAT      = -33.4324
 CUARTEL_LON      = -70.6477
 
 # ══════════════════════════════════════════
-#  CACHÉ GLOBAL
+#  CACHÉ GLOBAL & MEMORIA FOTOGRÁFICA
 # ══════════════════════════════════════════
 cache = {
     'emergencia': None,
     'personal':   None,
     'clima':      None,
     'clima_ts':   0,
-    'geo_cache':  {},   # texto_dirección → {lat, lon}
+    'memoria_despacho': {
+        'activa': False,
+        'codigo': '10-0',
+        'direccion': 'CUARTEL 8VA CIA',
+        'unidades': '',
+        'lat': CUARTEL_LAT,
+        'lon': CUARTEL_LON
+    }
 }
 
 clientes_sse  = []
 clientes_lock = threading.Lock()
 
 # ══════════════════════════════════════════
-#  FUENTE 1: EMERGENCI.APP
+#  MOTOR CENTRAL: MODO FRANCOTIRADOR (OCTAVA)
 # ══════════════════════════════════════════
-def coords_desde_emergenci():
+def chequear_central():
+    memoria = cache['memoria_despacho']
+    
     try:
-        r = requests.get(
-            EMERGENCI_URL,
-            timeout=8,
-            headers={'User-Agent': 'Mozilla/5.0 (compatible; Bomberos8cia/1.0)'}
-        )
-        html = r.text
-
-        lat_m = re.search(r'data-emergencia-lat=["\']?([^"\'>\s]+)', html)
-        lon_m = re.search(r'data-emergencia-lon=["\']?([^"\'>\s]+)', html)
-
-        if not lat_m or not lon_m:
-            print("[Emergenci] No se encontraron coordenadas en el HTML")
-            return None
-
-        lat = float(lat_m.group(1))
-        lon = float(lon_m.group(1))
-
-        # Validar que no sean las coordenadas del cuartel (sin emergencia activa)
-        dist = ((lat - CUARTEL_LAT)**2 + (lon - CUARTEL_LON)**2) ** 0.5
-        if dist < 0.0005:   # ~55 metros
-            print(f"[Emergenci] Coordenadas == cuartel, sin emergencia activa")
-            return None
-
-        print(f"[Emergenci] ✓ Coordenadas GPS exactas: {lat}, {lon}")
-        return {'lat': lat, 'lon': lon}
-
-    except Exception as e:
-        print(f"[Emergenci] Error al leer emergenci.app: {e}")
-        return None
-
-# ══════════════════════════════════════════
-#  FUENTE 2: GEOCODING (respaldo)
-# ══════════════════════════════════════════
-def extraer_direccion(texto):
-    if not texto:
-        return ''
-    t = re.sub(r'^[\d]+-[\d]+-[\d]+\s*', '', texto).strip()
-    t = re.sub(r'^[\d]+-[\d]+\s*', '', t).strip()
-    t = re.sub(r'\s+[A-Z]{1,3}\d+(?:,\s*[A-Z]{1,3}\d+)*\s*$', '', t).strip()
-    return t
-
-def geocodificar(direccion_raw):
-    if not direccion_raw:
-        return None
-
-    dir_limpia = direccion_raw.replace('/', ' y ').strip()
-    clave = dir_limpia.lower()
-
-    if clave in cache['geo_cache']:
-        return cache['geo_cache'][clave]
-
-    query   = dir_limpia + ', Santiago, Chile'
-    headers = {'User-Agent': 'Bomberos8cia/1.0 dashboard-interno'}
-    try:
-        r    = requests.get('https://nominatim.openstreetmap.org/search',
-                            params={'format': 'json', 'q': query, 'limit': 1},
-                            headers=headers, timeout=8)
+        r = requests.get('http://floppi4.floppi.one:5000/activos', timeout=8)
         data = r.json()
-        if data:
-            res = {'lat': float(data[0]['lat']), 'lon': float(data[0]['lon'])}
-            cache['geo_cache'][clave] = res
-            print(f"[Geo] Respaldo OK: {dir_limpia} → {res}")
-            return res
-        print(f"[Geo] Sin resultado: {query}")
-        return None
+        
+        for item in data.get('items', []):
+            info = item.get('json', {})
+            vehiculos = info.get('vehicles', [])
+            
+            nombres_carros = [v.get('name', '').upper() for v in vehiculos]
+            
+            # FILTRO 8VA: Buscamos máquinas que terminen exactamente en "-8" o "8"
+            if any(n.endswith('-8') or re.match(r'^[A-Z]+8$', n) for n in nombres_carros):
+                lat = float(info.get('lat', CUARTEL_LAT))
+                lon = float(info.get('lon', CUARTEL_LON))
+                codigo = info.get('emergency', {}).get('voceo clave', '10-0')
+                
+                d1 = info.get('street1', info.get('streetl', ''))
+                d2 = info.get('street2', '')
+                direccion = f"{d1} y {d2}".strip(" y ")
+                
+                memoria.update({
+                    'activa': True,
+                    'codigo': codigo,
+                    'direccion': direccion,
+                    'unidades': ", ".join(nombres_carros),
+                    'lat': lat,
+                    'lon': lon
+                })
+                print(f"[Central] ✓ Despacho 8va activo: {codigo} - {direccion}")
+                return memoria
+
+        memoria['activa'] = False
+        return memoria
+
     except Exception as e:
-        print(f"[Geo] Error: {e}")
-        return None
+        print(f"[Central] Error de lectura: {e}")
+        memoria['activa'] = False
+        return memoria
 
 # ══════════════════════════════════════════
 #  FETCH EMERGENCIA COMPLETO
@@ -111,34 +87,30 @@ def _fetch_emergencia():
     try:
         main_page = requests.get(
             f"https://icbs.cl/cuartel/index2.php?id_proce={ID_PROCE}",
-            timeout=10
+            timeout=10,
+            headers={'User-Agent': 'Mozilla/5.0'}
         ).text
+        
+        # Buscamos las llaves de seguridad exactas de la 8va
         m = re.search(r'time=(\d+)&hash=([a-fA-F0-9]+)', main_page)
-        ft = m.group(1) if m else "1772539491"
-        fh = m.group(2) if m else "8e047780fd8b4f351b7c9e0c03b9fa63"
+        if m:
+            ft = m.group(1)
+            fh = m.group(2)
+        else:
+            print("[Fetch] Advertencia: Usando llaves de respaldo para la 8va.")
+            ft = "1772761376"
+            fh = "85875c19bd6a0c18446915692ce0f2d2"
 
         datos = requests.get(
             f"https://icbs.cl/cuartel/datos.php?id_proce={ID_PROCE}&time={ft}&hash={fh}",
             timeout=10
         ).json()
 
-        coords = coords_desde_emergenci()
-
-        if coords is None:
-            llamados = datos.get('llamados') or []
-            if llamados:
-                texto     = llamados[0].get('texto', '')
-                direccion = extraer_direccion(texto)
-                if direccion:
-                    coords = geocodificar(direccion)
-                    if coords:
-                        print(f"[Fetch] Usando geocoding de respaldo")
-
-        datos['coordenadas_exactas'] = coords
+        datos['despacho_oficial'] = chequear_central()
         return datos
 
     except Exception as e:
-        print(f"[Fetch] Error: {e}")
+        print(f"[Fetch] Error general: {e}")
         return None
 
 # ══════════════════════════════════════════
@@ -253,7 +225,7 @@ def _hash(obj):
     return json.dumps(obj, sort_keys=True, ensure_ascii=False)
 
 def vigilante():
-    print("[Vigilante] Iniciado para la 8va Compañía.")
+    print("[Vigilante] Iniciado con conexión a API Central (Filtro 8va activo).")
     while True:
         try:
             data = requests.get(
@@ -262,7 +234,6 @@ def vigilante():
             if _hash(data) != _hash(cache.get('personal')):
                 cache['personal'] = data
                 notificar_clientes('personal', data)
-                print("[Vigilante] Personal → SSE")
         except Exception as e:
             pass
 
@@ -271,8 +242,6 @@ def vigilante():
             if nuevo and _hash(nuevo) != _hash(cache.get('emergencia')):
                 cache['emergencia'] = nuevo
                 notificar_clientes('emergencia', nuevo)
-                src = "GPS Emergenci" if nuevo.get('coordenadas_exactas') else "sin coords"
-                print(f"[Vigilante] Emergencia → SSE ({src})")
         except Exception as e:
             pass
 
